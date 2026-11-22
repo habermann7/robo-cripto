@@ -1,0 +1,938 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Robô de carteira cripto — SIMULAÇÃO (nenhum dinheiro real, nenhuma chave da Binance).
+
+O que ele faz toda vez que roda (1x por dia, depois das 21h no horário de Brasília):
+  1. ATUALIZA: baixa os preços diários de BTC e ETH da Binance (API pública, sem chave).
+  2. ESTUDA o cenário: tendência, volatilidade, RSI e, em situações parecidas no passado,
+     quantas vezes o preço subiu em 7 e 30 dias (probabilidade empírica, com tamanho da amostra).
+  3. ANALISA a carteira: pesos, distância até os gatilhos, risco ("e se repetir o pior?").
+  4. CALCULA antes de aportar: o que o próximo aporte vai comprar, custo e pesos resultantes.
+  5. DECIDE pela única regra que passou nos testes: rebalanceamento por faixas (70% na moeda,
+     vende o excesso acima de 80%, compra abaixo de 60%). As previsões NÃO mandam na decisão,
+     porque nos testes o modelo de previsão não acertou mais que o acaso.
+  6. Registra tudo em estado.json e gera o painel.html.
+
+Uso:  python robo.py                       (rodada normal)
+      python robo.py replay 2023-01-01 2026-11-21 [aporte] [taxa_x2]   (reexecuta o passado, só para teste/demonstração)
+Só usa a biblioteca padrão do Python (nada para instalar).
+"""
+import json, os, sys, time, math, urllib.request
+from datetime import datetime, timezone, timedelta
+
+try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception: pass
+PASTA = os.environ.get("ROBO_PASTA", os.path.dirname(os.path.abspath(__file__)))
+API = "https://data-api.binance.vision"
+MOEDAS = ["BTCUSDT", "ETHUSDT"]
+DIA = 86400000
+BRT = timezone(timedelta(hours=-3))
+CFG_PADRAO = {
+    "capital_inicial": 1000.0,   # US$ (USDT) simulados no começo
+    "aporte_mensal": 100.0,      # US$ por mês (0 desliga)
+    "dia_aporte": 5,             # dia do mês
+    "alvo": 0.70, "topo": 0.80, "piso": 0.60,   # fração em moeda: alvo e faixas
+    "taxa_pct": 0.10, "deslize_pct": 0.05,      # taxa Binance e deslize de preço, % por ordem
+    "ordem_minima": 10.0,
+}
+
+
+# ----------------------------------------------------------------- arquivos
+def caminho(*p): return os.path.join(PASTA, *p)
+
+def ler_json(arq, padrao):
+    try:
+        with open(arq, encoding="utf-8") as f: return json.load(f)
+    except Exception: return padrao
+
+def gravar_json(arq, obj):
+    os.makedirs(os.path.dirname(arq), exist_ok=True)
+    tmp = arq + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, arq)
+
+def carregar_cfg():
+    arq = caminho("config.json"); cfg = dict(CFG_PADRAO); cfg.update(ler_json(arq, {}))
+    if not os.path.exists(arq): gravar_json(arq, cfg)
+    return cfg
+
+def http(url, tent=3):
+    for k in range(tent):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "robo-simulacao"})
+            with urllib.request.urlopen(req, timeout=25) as r: return json.loads(r.read().decode())
+        except Exception:
+            if k == tent - 1: raise
+            time.sleep(2 * (k + 1))
+
+def ler_cache(sim): return ler_json(caminho("dados", sim + "_1d.json"), [])
+
+def atualizar_historico(sim, agora_ms):
+    velas = ler_cache(sim); ini = velas[-1]["t"] + DIA if velas else 1502928000000
+    andamento = None
+    while True:
+        dados = http(f"{API}/api/v3/klines?symbol={sim}&interval=1d&limit=1000&startTime={ini}")
+        if not dados: break
+        for k in dados:
+            v = {"t": k[0], "o": float(k[1]), "h": float(k[2]), "l": float(k[3]), "c": float(k[4]), "v": float(k[5])}
+            if k[6] < agora_ms: velas.append(v)
+            else: andamento = v
+        if len(dados) < 1000: break
+        ini = dados[-1][0] + DIA
+    gravar_json(caminho("dados", sim + "_1d.json"), velas)
+    return velas, andamento
+
+
+# ----------------------------------------------------------------- simulação
+def mes_chave(t):
+    d = datetime.fromtimestamp(t / 1000, timezone.utc); return f"{d.year}-{d.month:02d}"
+
+def dia_mes(t): return datetime.fromtimestamp(t / 1000, timezone.utc).day
+
+def estado_novo():
+    z = lambda: {s: {"caixa": 0.0, "un": 0.0} for s in MOEDAS}
+    n3 = lambda v: {"robo": v, "par70": v, "cheio": v}
+    return {"modo": "vivo", "inicio": None, "aberto_ate": 0, "ultimo_dia": 0, "mes_aporte": None,
+            "contrib": 0.0, "aporte_hoje": 0.0, "car": {"robo": z(), "par70": z(), "cheio": z()},
+            "pend": {s: None for s in MOEDAS}, "ult_eq": None, "idx": n3(1.0), "pico": n3(1.0),
+            "dd": n3(0.0), "ddmax": n3(0.0), "hist": [], "ops": []}
+
+def comprar(c, n, px, cfg):
+    f, s = cfg["taxa_pct"] / 100, cfg["deslize_pct"] / 100
+    n = min(n, c["caixa"])
+    if n < cfg["ordem_minima"]: return 0.0
+    c["caixa"] -= n; c["un"] += n * (1 - f) / (px * (1 + s)); return n
+
+def vender(c, q, px, cfg):
+    f, s = cfg["taxa_pct"] / 100, cfg["deslize_pct"] / 100
+    q = min(q, c["un"])
+    if q * px < cfg["ordem_minima"]: return 0.0
+    c["un"] -= q; c["caixa"] += q * px * (1 - s) * (1 - f); return q * px
+
+def registrar(est, t, s, lado, valor, px, motivo, tipo="rebalanceamento"):
+    est["ops"].append({"t": t, "moeda": s[:-4], "lado": lado, "valor": round(valor, 2), "preco": px, "motivo": motivo, "tipo": tipo})
+
+def fase_abertura(est, cfg, t, op):
+    """Executa, ao preço de abertura do dia, o que ficou combinado no fechamento anterior."""
+    n = len(MOEDAS); alvo = cfg["alvo"]
+    mistura = (("robo", alvo), ("par70", alvo), ("cheio", 1.0))
+    if est["inicio"] is None:
+        est["inicio"] = t; est["mes_aporte"] = mes_chave(t); est["contrib"] = cfg["capital_inicial"]
+        parte = cfg["capital_inicial"] / n
+        for s in MOEDAS:
+            for nome, a in mistura:
+                c = est["car"][nome][s]; c["caixa"] = parte; v = comprar(c, parte * a, op[s], cfg)
+                if nome == "robo" and v: registrar(est, t, s, "compra", v, op[s], f"compra inicial até {a*100:.0f}% na moeda", "inicial")
+        return
+    if cfg["aporte_mensal"] > 0 and dia_mes(t) >= cfg["dia_aporte"] and est["mes_aporte"] != mes_chave(t):
+        est["mes_aporte"] = mes_chave(t); est["contrib"] += cfg["aporte_mensal"]; est["aporte_hoje"] = cfg["aporte_mensal"]
+        parte = cfg["aporte_mensal"] / n
+        for s in MOEDAS:
+            for nome, a in mistura:
+                c = est["car"][nome][s]; c["caixa"] += parte
+                if nome == "robo":   # o aporte vai para o que está abaixo do alvo; nunca vende
+                    V = c["caixa"] + c["un"] * op[s]; diff = a * V - c["un"] * op[s]
+                    v = comprar(c, diff, op[s], cfg) if diff > 0 else 0
+                    if v: registrar(est, t, s, "compra", v, op[s], "aporte mensal levando a moeda de volta ao alvo", "aporte")
+                else: comprar(c, parte * a, op[s], cfg)
+    for s in MOEDAS:
+        p = est["pend"][s]
+        if not p: continue
+        c = est["car"]["robo"][s]; V = c["caixa"] + c["un"] * op[s]; diff = alvo * V - c["un"] * op[s]
+        v = comprar(c, diff, op[s], cfg) if diff > 0 else vender(c, -diff / op[s], op[s], cfg)
+        if v: registrar(est, t, s, "compra" if diff > 0 else "venda", v, op[s], f"peso era {p['peso']*100:.0f}% (faixa {cfg['piso']*100:.0f}–{cfg['topo']*100:.0f}%), voltando a {alvo*100:.0f}%")
+        est["pend"][s] = None
+
+def fase_fechamento(est, cfg, t, fe):
+    eq = {nome: sum(c["caixa"] + c["un"] * fe[s] for s, c in est["car"][nome].items()) for nome in est["car"]}
+    for nome in eq:
+        base = cfg["capital_inicial"] if est["ult_eq"] is None else est["ult_eq"][nome] + est["aporte_hoje"]
+        est["idx"][nome] *= eq[nome] / base if base > 0 else 1.0
+        est["pico"][nome] = max(est["pico"][nome], est["idx"][nome])
+        est["dd"][nome] = est["idx"][nome] / est["pico"][nome] - 1
+        est["ddmax"][nome] = min(est["ddmax"][nome], est["dd"][nome])
+    rb = {s: est["car"]["robo"][s]["caixa"] + est["car"]["robo"][s]["un"] * fe[s] for s in MOEDAS}
+    est["hist"].append({"t": t, "eq": {k: round(v, 2) for k, v in eq.items()}, "contrib": round(est["contrib"], 2),
+                        "dd": {k: round(v, 4) for k, v in est["dd"].items()}, "rb": {k: round(v, 2) for k, v in rb.items()}})
+    est["ult_eq"] = eq; est["aporte_hoje"] = 0.0
+    for s in MOEDAS:
+        c = est["car"]["robo"][s]; V = c["un"] * fe[s]; tot = V + c["caixa"]; w = V / tot if tot > 0 else 0
+        est["pend"][s] = {"lado": "venda", "peso": round(w, 4)} if w > cfg["topo"] else \
+                         {"lado": "compra", "peso": round(w, 4)} if w < cfg["piso"] else None
+
+def processar_dia(est, cfg, t, velas_dia):
+    if est["aberto_ate"] < t:
+        fase_abertura(est, cfg, t, {s: velas_dia[s]["o"] for s in MOEDAS}); est["aberto_ate"] = t
+    fase_fechamento(est, cfg, t, {s: velas_dia[s]["c"] for s in MOEDAS}); est["ultimo_dia"] = t
+
+
+# ----------------------------------------------------------------- cérebro: estudo do cenário
+def pct_(v, q): v = sorted(v); return v[int(q * (len(v) - 1))]
+
+def estudo_moeda(velas, px_vivo):
+    c = [v["c"] for v in velas]; n = len(c)
+    if n < 260: return None
+    sma = lambda i, k: sum(c[i - k + 1:i + 1]) / k
+    rets = [math.log(c[i] / c[i - 1]) for i in range(1, n)]
+    def vol(i): w = rets[i - 30:i]; m = sum(w) / 30; return math.sqrt(sum((x - m) ** 2 for x in w) / 29) * math.sqrt(365)
+    vols = [vol(i) for i in range(31, n)]; vol_atual = vols[-1]
+    d = [c[i] - c[i - 1] for i in range(n - 14, n)]
+    g = sum(x for x in d if x > 0) / 14; l = -sum(x for x in d if x < 0) / 14
+    rsi = 100.0 if l == 0 else 100 - 100 / (1 + g / l)
+    s200 = sma(n - 1, 200); s50 = sma(n - 1, 50); topo365 = max(c[-365:])
+    def estado(i):
+        m = c[i] / c[i - 30] - 1
+        return (c[i] > sma(i, 200), 0 if m < -0.15 else (1 if m <= 0.15 else 2))
+    atual = estado(n - 1); out = {}
+    for h in (7, 30):
+        todas, parecidas = [], []
+        for i in range(200, n - h):
+            r = c[i + h] / c[i] - 1; todas.append(r)
+            if estado(i) == atual: parecidas.append(r)
+        if parecidas:
+            out[h] = {"n": len(parecidas), "p_alta": sum(1 for r in parecidas if r > 0) / len(parecidas),
+                      "mediana": pct_(parecidas, 0.5), "p5": pct_(parecidas, 0.05), "p95": pct_(parecidas, 0.95),
+                      "base": sum(1 for r in todas if r > 0) / len(todas)}
+    r30 = [c[i + 30] / c[i] - 1 for i in range(n - 30)]
+    return {"preco": px_vivo, "tendencia_alta": px_vivo > s200, "sma200": s200, "sma50": s50,
+            "dist_sma200": px_vivo / s200 - 1, "dist_topo365": px_vivo / topo365 - 1, "rsi": rsi,
+            "ret7": c[-1] / c[-8] - 1, "ret30": c[-1] / c[-31] - 1, "vol": vol_atual,
+            "vol_pctil": sum(1 for v in vols if v <= vol_atual) / len(vols),
+            "momento": ["queda forte (>15%)", "lateral", "alta forte (>15%)"][atual[1]],
+            "prob": out, "pior30": min(r30), "p5_30": pct_(r30, 0.05)}
+
+def resumo_texto(nome, e):
+    if not e: return "Histórico insuficiente."
+    t = f"{nome} está em tendência de {'alta' if e['tendencia_alta'] else 'baixa'} ({e['dist_sma200']*100:+.0f}% vs média de 200 dias), {abs(e['dist_topo365'])*100:.0f}% abaixo do topo de 1 ano. "
+    p = e["prob"].get(7)
+    if p:
+        dif = p["p_alta"] - p["base"]
+        v = "sem vantagem clara" if abs(dif) < 0.05 else ("leve viés de alta" if dif > 0 else "leve viés de baixa")
+        t += f"Em {p['n']} dias parecidos no passado ({e['momento']}, {'acima' if e['tendencia_alta'] else 'abaixo'} da média 200), subiu em 7 dias em {p['p_alta']*100:.0f}% das vezes contra {p['base']*100:.0f}% no geral: {v}"
+        t += "; amostra pequena. " if p["n"] < 60 else ". "
+    return t + "Isso informa, mas não muda a regra."
+
+
+# ----------------------------------------------------------------- cérebro: carteira, gatilhos, risco, aporte
+def valor_robo(est, vivo): return sum(c["caixa"] + c["un"] * vivo[s] for s, c in est["car"]["robo"].items())
+
+def analisar_carteira(est, cfg, vivo, estudos):
+    alvo, topo, piso = cfg["alvo"], cfg["topo"], cfg["piso"]; n = len(MOEDAS); moedas = {}
+    for s in MOEDAS:
+        c = est["car"]["robo"][s]; px = vivo[s]; V = c["un"] * px; tot = V + c["caixa"]; w = V / tot if tot else 0
+        gat_v = topo / (1 - topo) * c["caixa"] / V if V > 0 else None
+        gat_c = piso / (1 - piso) * c["caixa"] / V if V > 0 else None
+        p = est["pend"][s]; diff = alvo * tot - V
+        if p: acao, valor = p["lado"], abs(diff)
+        else: acao, valor = "manter", 0.0
+        moedas[s[:-4]] = {"peso": w, "valor_moeda": V, "caixa": c["caixa"], "un": c["un"], "preco": px, "acao": acao, "valor_ordem": valor,
+                          "preco_venda": px * gat_v if gat_v else None, "preco_compra": px * gat_c if gat_c else None,
+                          "sobe_ate_vender": gat_v - 1 if gat_v else None, "cai_ate_comprar": gat_c - 1 if gat_c else None}
+    risco = {}
+    for s in MOEDAS:
+        e = estudos.get(s[:-4]); V = est["car"]["robo"][s]["un"] * vivo[s]
+        if e: risco[s[:-4]] = {"exposicao": V, "perda_pior30": V * e["pior30"], "perda_p5_30": V * e["p5_30"], "pior30": e["pior30"], "p5_30": e["p5_30"]}
+    tot = valor_robo(est, vivo)
+    risco_tot = {"pior30": sum(r["perda_pior30"] for r in risco.values()), "p5_30": sum(r["perda_p5_30"] for r in risco.values()), "total": tot}
+    # próximo aporte (cálculo antes de aportar)
+    ref = est["ultimo_dia"] + DIA if est["ultimo_dia"] else int(time.time() * 1000)
+    d = datetime.fromtimestamp(ref / 1000, timezone.utc)
+    ano, mes = d.year, d.month
+    if est["mes_aporte"] == f"{ano}-{mes:02d}" or d.day > cfg["dia_aporte"]:
+        if est["mes_aporte"] == f"{ano}-{mes:02d}": mes += 1
+        if mes == 13: ano, mes = ano + 1, 1
+    proximo = f"{cfg['dia_aporte']:02d}/{mes:02d}/{ano}"
+    parte = cfg["aporte_mensal"] / n; aporte = []
+    for s in MOEDAS:
+        c = est["car"]["robo"][s]; px = vivo[s]; caixa = c["caixa"] + parte; V = c["un"] * px; tt = caixa + V
+        diff = alvo * tt - V; compra = min(max(diff, 0), caixa); compra = compra if compra >= cfg["ordem_minima"] else 0
+        custo = compra * (cfg["taxa_pct"] + cfg["deslize_pct"]) / 100
+        aporte.append({"moeda": s[:-4], "entra": parte, "compra": compra, "custo": custo,
+                       "peso_antes": V / (V + c["caixa"]) if (V + c["caixa"]) else 0, "peso_depois": (V + compra * (1 - cfg["taxa_pct"] / 100)) / tt if tt else 0})
+    # portão para dinheiro real
+    h = est["hist"]; dias = (est["ultimo_dia"] - est["inicio"]) / DIA + 1 if est["inicio"] and est["ultimo_dia"] else 0
+    ret = {k: valor_robo_nome(est, k, vivo) for k in ("robo", "par70", "cheio")}; ix = est["idx"]
+    portao = [
+        {"item": "Pelo menos 8 semanas de simulação", "ok": dias >= 56, "detalhe": f"{int(dias)} de 56 dias"},
+        {"item": "Retorno não pior que a mesma mistura parada", "ok": ix["robo"] >= ix["par70"], "detalhe": f"robô {(ix['robo']-1)*100:+.1f}% vs parada {(ix['par70']-1)*100:+.1f}%"},
+        {"item": "Queda máxima não pior que a mistura parada", "ok": est["ddmax"]["robo"] >= est["ddmax"]["par70"], "detalhe": f"robô {est['ddmax']['robo']*100:.0f}% vs parada {est['ddmax']['par70']*100:.0f}%"},
+    ]
+    return {"moedas": moedas, "risco": risco, "risco_total": risco_tot, "aporte": {"proximo": proximo, "valor": cfg["aporte_mensal"], "itens": aporte},
+            "portao": portao, "valores": ret}
+
+def valor_robo_nome(est, nome, vivo): return sum(c["caixa"] + c["un"] * vivo[s] for s, c in est["car"][nome].items())
+
+
+# ----------------------------------------------------------------- painel
+def gerar_painel(est, cfg, vivo, estudos, analise, brl, rotulo):
+    agora = datetime.now(BRT).strftime("%d/%m/%Y %H:%M")
+    dados = {"cfg": cfg, "rotulo": rotulo, "atualizado": agora, "brl": brl, "vivo": {k[:-4]: v for k, v in vivo.items()},
+             "est": {k: est[k] for k in ("modo", "inicio", "ultimo_dia", "contrib", "idx", "dd", "ddmax", "hist", "ops")},
+             "estudos": estudos, "analise": analise, "textos": {k: resumo_texto(k, v) for k, v in estudos.items()}}
+    html = MODELO.replace("/*__DADOS__*/", "const D=" + json.dumps(dados, ensure_ascii=False) + ";")
+    with open(caminho("painel.html" if rotulo == "vivo" else "painel_demo.html"), "w", encoding="utf-8") as f: f.write(html)
+
+
+def rodada():
+    cfg = carregar_cfg(); est = ler_json(caminho("estado.json"), None) or estado_novo()
+    agora = int(time.time() * 1000); velas, vivo, andamento = {}, {}, {}
+    for s in MOEDAS:
+        velas[s], andamento[s] = atualizar_historico(s, agora)
+        vivo[s] = andamento[s]["c"] if andamento[s] else velas[s][-1]["c"]
+    if est["inicio"] is None and est["ultimo_dia"] == 0: est["ultimo_dia"] = velas[MOEDAS[0]][-1]["t"]
+    mapa = {s: {v["t"]: v for v in velas[s]} for s in MOEDAS}
+    for t in sorted(t for t in mapa[MOEDAS[0]] if t > est["ultimo_dia"] and all(t in mapa[s] for s in MOEDAS)):
+        processar_dia(est, cfg, t, {s: mapa[s][t] for s in MOEDAS})
+    if all(andamento.values()) and est["aberto_ate"] < andamento[MOEDAS[0]]["t"]:
+        fase_abertura(est, cfg, andamento[MOEDAS[0]]["t"], {s: andamento[s]["o"] for s in MOEDAS}); est["aberto_ate"] = andamento[MOEDAS[0]]["t"]
+    gravar_json(caminho("estado.json"), est)
+    estudos = {s[:-4]: estudo_moeda(velas[s], vivo[s]) for s in MOEDAS}
+    analise = analisar_carteira(est, cfg, vivo, estudos)
+    try: brl = float(http(f"{API}/api/v3/ticker/price?symbol=USDTBRL")["price"])
+    except Exception: brl = None
+    gerar_painel(est, cfg, vivo, estudos, analise, brl, "vivo")
+    print("Painel atualizado:", caminho("painel.html"))
+    for k, m in analise["moedas"].items():
+        print(f"  {k}: peso {m['peso']*100:.0f}% | decisão: {m['acao']}" + (f" ~US$ {m['valor_ordem']:.0f}" if m["valor_ordem"] else ""))
+
+
+def replay(ini, fim, cfg, saida_painel=True):
+    est = estado_novo(); est["modo"] = "demo"
+    velas = {s: ler_cache(s) for s in MOEDAS}; mapa = {s: {v["t"]: v for v in velas[s]} for s in MOEDAS}
+    for t in sorted(t for t in mapa[MOEDAS[0]] if ini <= t <= fim and all(t in mapa[s] for s in MOEDAS)):
+        processar_dia(est, cfg, t, {s: mapa[s][t] for s in MOEDAS})
+    corte = {s: [v for v in velas[s] if v["t"] <= fim] for s in MOEDAS}
+    vivo = {s: corte[s][-1]["c"] for s in MOEDAS}
+    estudos = {s[:-4]: estudo_moeda(corte[s], vivo[s]) for s in MOEDAS}
+    analise = analisar_carteira(est, cfg, vivo, estudos)
+    if saida_painel: gerar_painel(est, cfg, vivo, estudos, analise, None, "demo")
+    return est, analise
+
+
+MODELO = r'''<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Sala · robô de carteira cripto</title>
+<style>
+:root{
+  --ink:#2b211c;--mut:#5a4a41;--line:rgb(74 49 33/16%);--rim:rgb(255 252 245/58%);
+  --edge-l:rgb(255 254 248/80%);--edge-s:rgb(57 40 28/18%);--gloss:rgb(255 251 242/42%);
+  --stage:rgb(247 236 222/36%);--rail:rgb(243 226 210/58%);--card:rgb(252 246 238/58%);--raised:rgb(255 250 244/86%);--inner:rgb(255 250 244/48%);
+  --surface:#f6ece2;--track:rgb(81 49 32/14%);--pick:#fff9f3;--pick-ink:#241b17;--prim:#2a201b;--prim-ink:#fff8f0;
+  --teal:#0b6a55;--coral:#a43c27;--ochre:#8a5a00;--blue:#3a5a90;--cash:#8b7a6e;--focus:#14504a;--shadow:35 21 14;
+  --scene-1:#e8c8a4;--scene-2:#d29672;--scene-3:#7a5742;--scene-base:#b08f76;
+}
+[data-theme=dark]{
+  --ink:#fbefdf;--mut:#dccbbb;--line:rgb(243 221 198/18%);--rim:rgb(255 236 212/26%);
+  --edge-l:rgb(255 242 225/42%);--edge-s:rgb(10 5 4/34%);--gloss:rgb(255 237 213/11%);
+  --stage:rgb(38 28 25/50%);--rail:rgb(44 32 30/62%);--card:rgb(52 39 36/58%);--raised:rgb(86 71 65/80%);--inner:rgb(80 63 58/46%);
+  --surface:#3a2e2a;--track:rgb(245 226 212/16%);--pick:#f9eee0;--pick-ink:#241b17;--prim:#f3ddca;--prim-ink:#231a16;
+  --teal:#7adcc3;--coral:#ff9a80;--ochre:#f1be58;--blue:#a2bdee;--cash:#a8978a;--focus:#f9bf9b;--shadow:8 3 2;
+  --scene-1:#6a4533;--scene-2:#4b3027;--scene-3:#241713;--scene-base:#2f211c;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;color:var(--ink);font:14px/1.5 "Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,"SF Pro Text","Helvetica Neue",sans-serif;font-weight:500;font-variant-numeric:tabular-nums;min-height:100svh;background:var(--scene-base)}
+h1,h2,h3,p,figure,dl,dd{margin:0}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer}
+a{color:inherit;text-decoration:none}
+:where(button,a,select,[tabindex]):focus-visible{outline:2px solid var(--focus);outline-offset:3px;border-radius:10px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+svg{flex:none}
+
+/* cena de fundo: luz quente de fim de tarde, sem imagem externa */
+.scene{position:fixed;inset:0;z-index:-1;pointer-events:none;
+  background:radial-gradient(1100px 680px at 8% -8%,var(--scene-1),transparent 62%),radial-gradient(900px 620px at 100% 8%,var(--scene-2),transparent 58%),radial-gradient(1000px 720px at 45% 112%,var(--scene-3),transparent 62%),var(--scene-base)}
+.scene::after{content:"";position:absolute;inset:0;opacity:.07;mix-blend-mode:multiply;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
+
+.app{width:min(calc(100% - 100px),1320px);margin:0 auto;padding:22px 0 20px}
+.glass{border:1px solid var(--rim);background:linear-gradient(165deg,var(--gloss),transparent 34% 74%,var(--gloss)),var(--rail);
+  box-shadow:inset 1px 1px 1px var(--edge-l),inset -1px -1px 1px var(--edge-s),0 8px 24px rgb(var(--shadow)/16%);
+  backdrop-filter:blur(16px) saturate(1.3);-webkit-backdrop-filter:blur(16px) saturate(1.3)}
+
+/* barra de cima */
+.top{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,430px) minmax(0,1fr);align-items:center;gap:12px;min-height:62px;border-radius:999px;padding:7px 10px 7px 14px}
+.brand{display:flex;align-items:center;gap:10px;min-width:0}
+.logo{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;background:var(--pick);color:var(--pick-ink);box-shadow:0 2px 7px rgb(var(--shadow)/14%)}
+.logo svg{width:20px;height:20px}
+.brand strong{display:block;font-size:15px;font-weight:800;letter-spacing:-.02em;line-height:1.1}
+.brand small{display:block;font-size:11px;color:var(--mut);margin-top:2px}
+.status{display:flex;align-items:center;gap:10px;min-height:44px;max-width:100%;border:1px solid var(--line);border-radius:999px;background:var(--inner);padding:4px 12px 4px 10px;text-align:start}
+.status:hover,.ib:hover{background:var(--raised)}
+.orb{flex:none;width:12px;height:12px;border-radius:50%;background:var(--teal);box-shadow:0 0 0 4px color-mix(in srgb,var(--teal) 18%,transparent)}
+.status[data-tipo=acao] .orb{background:var(--ochre);box-shadow:0 0 0 4px color-mix(in srgb,var(--ochre) 22%,transparent)}
+.status[data-tipo=alerta] .orb{background:var(--coral);box-shadow:0 0 0 4px color-mix(in srgb,var(--coral) 22%,transparent)}
+.status-txt{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:12.5px;font-weight:700;animation:digita .8s steps(30,end) both}
+@keyframes digita{from{clip-path:inset(0 100% 0 0)}}
+.status svg{width:14px;height:14px;margin-inline-start:auto;color:var(--mut)}
+.top-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px}
+.mode{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:750;padding:6px 11px;border-radius:999px;border:1px solid var(--line);background:var(--inner);white-space:nowrap}
+.mode i{width:7px;height:7px;border-radius:50%;background:var(--teal)}
+.mode[data-demo=true] i{background:var(--ochre)}
+.ib{position:relative;width:44px;height:44px;display:inline-grid;place-items:center;border-radius:999px;border:1px solid var(--line);background:var(--inner);padding:0}
+.ib svg{width:18px;height:18px}
+
+/* palco */
+.stage-wrap{position:relative;margin-top:12px}
+.stage{border-radius:34px;background:linear-gradient(150deg,var(--gloss),transparent 20% 78%,color-mix(in srgb,var(--gloss) 50%,transparent)),var(--stage);
+  box-shadow:inset 1px 1px 1px var(--edge-l),inset -1px -1px 1px var(--edge-s),0 22px 70px rgb(var(--shadow)/22%);
+  backdrop-filter:blur(14px) saturate(1.25);-webkit-backdrop-filter:blur(14px) saturate(1.25);padding:clamp(20px,2.4vw,38px) clamp(22px,3.2vw,50px) 40px;min-height:560px}
+.view-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px 22px;margin-bottom:22px;flex-wrap:wrap}
+.view-head h1{font-size:clamp(28px,3.2vw,44px);font-weight:760;letter-spacing:-.055em;line-height:1.04}
+.view-head p{color:var(--mut);margin-top:8px;max-width:56ch}
+.view-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.content{min-width:0;transition:opacity .14s ease,filter .14s ease}
+.content.out{opacity:0;filter:blur(8px)}
+
+/* dock */
+.rail{position:absolute;left:-26px;top:0;bottom:0;z-index:3}
+.dock{display:flex;align-items:center;gap:3px;padding:4px;border-radius:999px;position:relative}
+.dock-side{flex-direction:column;position:sticky;top:92px}
+.dock-bottom{display:none}
+.dock a{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:7px;min-width:44px;min-height:44px;padding:0 14px;border-radius:999px;font-size:12px;font-weight:780;white-space:nowrap}
+.dock-side a{padding:0}
+.dock a svg{width:18px;height:18px}
+.dock a[aria-current=page]{color:var(--pick-ink)}
+.dock a:not([aria-current=page]):hover{background:var(--inner)}
+.ind{position:absolute;inset:0 auto auto 0;border-radius:999px;background:var(--pick);box-shadow:inset 0 1px 0 #fff,0 2px 7px rgb(var(--shadow)/16%);visibility:hidden;pointer-events:none}
+.ind[data-ready=true]{visibility:visible;transition:transform .34s cubic-bezier(.24,.89,.26,1),width .34s cubic-bezier(.24,.89,.26,1),height .34s cubic-bezier(.24,.89,.26,1)}
+.tipnav{display:none;position:absolute;left:calc(100% + 8px);padding:6px 10px;border-radius:8px;background:var(--surface);border:1px solid var(--rim);box-shadow:0 3px 9px rgb(var(--shadow)/18%);pointer-events:none;color:var(--ink)}
+.dock-side a:is(:hover,:focus-visible) .tipnav{display:block}
+.dock-side .t{display:none}
+
+/* blocos */
+.grid{display:grid;gap:14px}
+.g-hoje{grid-template-columns:minmax(0,1.1fr) minmax(0,1.35fr) minmax(0,1fr);align-items:stretch}
+.g-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.g-21{grid-template-columns:minmax(0,1.5fr) minmax(0,1fr)}
+.g-4{grid-template-columns:repeat(4,minmax(0,1fr))}
+.card{min-width:0;border:1px solid var(--rim);border-radius:22px;padding:16px 18px;background:linear-gradient(144deg,rgb(255 251 245/30%),transparent 66%),var(--card);box-shadow:inset 0 1px 1px var(--edge-l),inset 0 -1px 1px var(--edge-s),0 6px 18px rgb(var(--shadow)/8%)}
+.card h2{font-size:15px;font-weight:800;letter-spacing:-.02em}
+.card .sub{font-size:12px;color:var(--mut);margin-top:3px}
+.card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px 12px;flex-wrap:wrap;margin-bottom:12px}
+.small{font-size:12.5px}.mut{color:var(--mut)}
+.row{display:flex;justify-content:space-between;gap:14px;padding:8px 0;border-top:1px solid var(--line);font-size:13.5px}
+.row:first-of-type{border-top:0}
+.row>span:first-child{color:var(--mut)}.row>span:last-child{text-align:end}
+
+/* hero */
+.hero{padding:4px 2px 24px}
+.hero-title{font-size:clamp(30px,4.3vw,58px);font-weight:760;letter-spacing:-.06em;line-height:1.02;max-width:20ch}
+.hero-text{margin-top:14px;color:var(--mut);font-size:15px;max-width:62ch}
+.coins{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0;margin-top:26px;border-block:1px solid var(--line)}
+.coin{padding:18px 4px 20px 0;min-width:0}
+.coin+.coin{padding-left:26px;border-inline-start:1px solid var(--line)}
+.coin-top{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
+.coin-name{display:inline-flex;align-items:center;gap:8px;font-weight:800;font-size:15px}
+.coin-name i,.dot-k{width:10px;height:10px;border-radius:3px;background:var(--c,var(--cash));display:inline-block}
+[data-coin=BTC]{--c:var(--ochre)}[data-coin=ETH]{--c:var(--blue)}[data-coin=CAIXA]{--c:var(--cash)}
+.coin-peso{font-size:30px;font-weight:780;letter-spacing:-.05em}
+.gauge{position:relative;height:12px;border-radius:99px;background:var(--track);margin:12px 0 24px}
+.gauge .band{position:absolute;top:0;bottom:0;border-radius:99px;background:color-mix(in srgb,var(--teal) 30%,transparent);border:1px solid color-mix(in srgb,var(--teal) 55%,transparent)}
+.gauge .pin{position:absolute;top:50%;width:18px;height:18px;border-radius:50%;background:var(--c);border:3px solid var(--surface);box-shadow:0 1px 5px rgb(var(--shadow)/30%);transform:translate(-50%,-50%)}
+.gauge .lb{position:absolute;top:18px;transform:translateX(-50%);font-size:11px;color:var(--mut)}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:760;padding:4px 10px;border-radius:99px;border:1px solid var(--line);background:var(--inner);white-space:nowrap}
+.chip.on{background:var(--prim);color:var(--prim-ink);border-color:transparent}
+.chip.ok{color:var(--teal);border-color:color-mix(in srgb,var(--teal) 45%,transparent)}
+.chip.no{color:var(--coral);border-color:color-mix(in srgb,var(--coral) 45%,transparent)}
+.chip svg{width:13px;height:13px}
+
+.big{display:block;font-size:clamp(30px,3.3vw,46px);font-weight:790;letter-spacing:-.062em;line-height:1.04;margin:4px 0 6px}
+.delta{display:inline-flex;align-items:center;gap:3px;font-weight:800;color:var(--teal)}
+.delta.neg{color:var(--coral)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:42px;padding:8px 15px;border-radius:99px;border:1px solid var(--rim);background:var(--raised);font-size:12.5px;font-weight:780;line-height:1.2}
+.btn:hover{background:var(--surface)}
+.btn.prim{background:var(--prim);color:var(--prim-ink);border-color:transparent}
+.btn.prim:hover{filter:brightness(1.18)}
+.btn svg{width:15px;height:15px}
+.pills{display:inline-flex;padding:3px;border-radius:99px;border:1px solid var(--rim);background:var(--inner)}
+.pills button{min-height:38px;min-width:54px;padding:0 12px;border:0;border-radius:99px;background:transparent;font-size:12px;font-weight:760}
+.pills button[aria-pressed=true]{background:var(--prim);color:var(--prim-ink)}
+.pills button[aria-pressed=false]:hover{background:var(--inner)}
+.sel{display:inline-flex;align-items:center;min-height:40px;border:1px solid var(--line);border-radius:12px;background:var(--inner);padding:0 10px}
+.sel select{border:0;background:transparent;min-height:36px}
+.sel select option{color:var(--ink);background:var(--surface)}
+
+.meter{height:8px;border-radius:99px;background:var(--track);overflow:hidden;margin:10px 0 8px}
+.meter i{display:block;height:100%;border-radius:inherit;background:var(--teal)}
+
+/* indicadores */
+.kpi{display:flex;flex-direction:column;justify-content:space-between;min-height:116px}
+.kpi-h{display:flex;justify-content:space-between;align-items:center;gap:6px;font-size:12.5px;font-weight:740}
+.kpi-i{width:30px;height:30px;border-radius:10px;display:grid;place-items:center;background:var(--inner);box-shadow:inset 0 1px 0 var(--gloss)}
+.kpi-i svg{width:15px;height:15px}
+.kpi b{display:block;font-size:clamp(22px,2.3vw,32px);font-weight:790;letter-spacing:-.055em;line-height:1.05;margin:6px 0 4px}
+.kpi small{color:var(--mut);font-size:11.5px}
+.kpi.dest{background:radial-gradient(ellipse at 5% -20%,#3a9381,transparent 68%),linear-gradient(145deg,#1e7461,#08443a);color:#fff;border-color:rgb(196 248 231/45%)}
+.kpi.dest small{color:#dcf3ec}.kpi.dest .kpi-i{background:rgb(235 255 247/16%)}.kpi.dest .delta{color:#b8f1dd}
+
+/* gráficos */
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:var(--mut);margin-bottom:8px}
+.legend span{display:inline-flex;align-items:center;gap:7px}
+.legend i{display:inline-block;width:20px;height:0;border-top:3px solid var(--lc);border-top-style:var(--ls,solid)}
+.chart{position:relative;min-width:0}
+.chart svg{display:block;overflow:visible;touch-action:pan-y}
+.chart text{font-size:11px;fill:var(--mut)}
+.gl{stroke:var(--line)}
+.s{fill:none;stroke-linejoin:round;stroke-linecap:round}
+.s-robo{stroke:var(--teal)}.s-par{stroke:var(--ink);opacity:.85}.s-cheio{stroke:var(--mut)}.s-ap{stroke:var(--mut);opacity:.65}
+.lab-robo{fill:var(--teal)!important;font-weight:800}.lab-par{fill:var(--ink)!important;font-weight:700}.lab-cheio{fill:var(--mut)!important}
+.area{fill:color-mix(in srgb,var(--teal) 18%,transparent);stroke:none}
+.cur{stroke:var(--mut);stroke-dasharray:3 4;opacity:0}
+.tip{position:absolute;top:4px;pointer-events:none;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:7px 10px;font-size:12px;box-shadow:0 5px 14px rgb(var(--shadow)/18%);white-space:nowrap;display:grid;gap:2px}
+.tip span{display:flex;justify-content:space-between;gap:14px}
+.tip[hidden]{display:none}
+.empty{border:1px dashed var(--line);border-radius:16px;padding:18px;color:var(--mut);font-size:13px}
+.ringbox{flex:1;align-content:center;display:grid;grid-template-columns:150px minmax(0,1fr);gap:16px;align-items:center}
+.ring{position:relative;width:150px;height:150px}
+.ring svg{width:100%;height:100%;display:block}
+.ring circle.sg{fill:none;stroke:var(--c);stroke-width:14;transition:opacity .2s}
+.ring circle.sg[data-m=true]{opacity:.28}
+.ring-c{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none;text-align:center}
+.ring-c b{font-size:16px;letter-spacing:-.04em}.ring-c span{font-size:11px;color:var(--mut)}
+.lg-list{display:grid;gap:3px}
+.lg-list button{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;text-align:start;min-height:40px;border:0;border-radius:10px;background:transparent;padding:4px 8px}
+.lg-list button:is(:hover,[aria-pressed=true]){background:var(--inner)}
+.lg-list .nm{display:inline-flex;align-items:center;gap:8px;font-weight:700}
+
+/* estudo */
+.prob{margin:10px 0 4px}
+.bars{display:grid;gap:7px}
+.bar-r{display:grid;grid-template-columns:118px minmax(0,1fr) 44px;gap:10px;align-items:center;font-size:12.5px}
+.bar-t{position:relative;height:10px;border-radius:99px;background:var(--track)}
+.bar-t i{position:absolute;left:0;top:0;bottom:0;border-radius:99px;background:var(--c,var(--teal))}
+.bar-t::after{content:"";position:absolute;left:50%;top:-3px;bottom:-3px;width:1px;background:var(--mut);opacity:.6}
+.bar-r b{text-align:end}
+.note{background:var(--inner);border:1px solid var(--line);border-radius:14px;padding:11px 14px;color:var(--mut);font-size:13px;max-width:100%}
+.note strong{color:var(--ink)}
+
+/* listas */
+.ops{display:grid}
+.op{display:grid;grid-template-columns:128px minmax(0,1fr) auto;gap:12px;padding:12px 2px;border-top:1px solid var(--line);align-items:start}
+.op:first-child{border-top:0}
+.op-d{font-size:12.5px;color:var(--mut)}
+.op-d b{display:block;color:var(--ink);font-size:13px}
+.op-m b{font-weight:760}.op-m p{color:var(--mut);font-size:12.5px;margin-top:2px}
+.op-v{text-align:end}.op-v b{display:block}.op-v span{font-size:12px;color:var(--mut)}
+.ck{display:flex;gap:12px;align-items:flex-start;padding:9px 0;border-top:1px solid var(--line)}
+.ck:first-of-type{border-top:0}
+.ck-i{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;flex:none;border:1.5px solid var(--cash)}
+.ck-i svg{width:14px;height:14px}
+.ck.ok .ck-i{background:var(--teal);border-color:var(--teal);color:var(--surface)}
+.ck p{font-size:12.5px;color:var(--mut)}
+.lab-r{margin-bottom:14px}
+.idea{padding:14px 0;border-top:1px solid var(--line)}
+.idea:first-of-type{border-top:0}
+.idea-h{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
+.idea-h h3{font-size:14.5px;font-weight:800;letter-spacing:-.02em}
+.idea .rule{color:var(--mut);font-size:13px;margin-top:4px;max-width:70ch}
+.nums{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
+.num{border:1px solid var(--line);border-radius:12px;padding:9px 12px;background:var(--inner);font-size:12.5px}
+.num b{display:block;margin-bottom:3px;font-size:13px}
+.num div{display:flex;justify-content:space-between;gap:10px}
+.why{margin-top:10px;font-size:13px}
+
+.foot{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:30px 4px 4px;font-size:11.5px}
+.foot span{background:var(--raised);padding:5px 10px;border-radius:99px}
+
+/* aviso (dialog) */
+dialog{max-width:min(calc(100% - 26px),500px);width:100%;border-radius:24px;border:1px solid var(--rim);color:var(--ink);padding:0;background:var(--surface);box-shadow:0 20px 80px rgb(var(--shadow)/40%)}
+dialog::backdrop{background:rgb(30 21 17/45%);backdrop-filter:blur(5px)}
+.dlg{padding:20px}
+.dlg header{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}
+.dlg h2{font-size:22px;font-weight:800;letter-spacing:-.04em}
+.av{display:flex;gap:12px;align-items:flex-start;width:100%;text-align:start;border:1px solid var(--line);border-radius:14px;background:var(--inner);padding:11px 12px;margin-bottom:7px}
+a.av:hover{background:var(--raised)}
+.av-i{width:32px;height:32px;border-radius:10px;display:grid;place-items:center;background:var(--card);flex:none}
+.av-i svg{width:16px;height:16px}
+.av[data-tipo=acao] .av-i{color:var(--ochre)}.av[data-tipo=alerta] .av-i{color:var(--coral)}
+.av strong{display:block;font-size:13.5px}.av p{font-size:12.5px;color:var(--mut);margin-top:2px}
+
+@media (max-width:1060px){
+  .app{width:calc(100% - 74px)}
+  .g-hoje{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+  .g-hoje>.mid{grid-column:1/-1;order:3}
+  .g-4{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media (max-width:760px){
+  .app{width:calc(100% - 22px);padding-top:10px;padding-bottom:calc(84px + env(safe-area-inset-bottom))}
+  .top{grid-template-columns:minmax(0,1fr) auto;border-radius:24px;padding:8px 10px;gap:6px 10px}
+  .status{grid-area:2/1/3/-1;min-height:42px}
+  .mode{font-size:11px;padding:5px 9px}
+  .brand small{display:none}
+  .stage{border-radius:26px;padding:18px 14px 26px;min-height:0}
+  .rail{display:none}
+  .dock-bottom{display:flex;position:fixed;z-index:5;inset:auto 10px calc(9px + env(safe-area-inset-bottom));justify-content:space-between}
+  .dock-bottom a{flex:1;flex-direction:column;gap:2px;padding:3px 4px;min-height:50px;font-size:10.5px;min-width:0}
+  .dock-bottom a svg{width:17px;height:17px}
+  .view-head{align-items:flex-start;flex-direction:column;gap:10px;margin-bottom:16px}
+  .g-hoje,.g-2,.g-21{grid-template-columns:minmax(0,1fr)}
+  .g-hoje>.mid{order:0;grid-column:auto}
+  .g-4{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .coins{grid-template-columns:minmax(0,1fr)}
+  .coin+.coin{padding-left:0;border-inline-start:0;border-top:1px solid var(--line)}
+  .card{padding:14px}
+  .ringbox{grid-template-columns:minmax(0,1fr);justify-items:center}
+  .lg-list{width:100%}
+  .nums{grid-template-columns:minmax(0,1fr)}
+  .op{grid-template-columns:96px minmax(0,1fr) auto;gap:8px}
+  .bar-r{grid-template-columns:96px minmax(0,1fr) 40px;gap:8px}
+  .pills button{min-height:42px;min-width:48px;padding:0 9px}
+}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+@media (prefers-reduced-transparency:reduce),(prefers-contrast:more){.glass,.stage,.card{background:var(--surface);backdrop-filter:none;-webkit-backdrop-filter:none}}
+</style>
+</head>
+<body>
+<div class="scene" aria-hidden="true"></div>
+<div class="app">
+  <header class="top glass">
+    <div class="brand"><span class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V9l8-5 8 5v11"/><path d="M9 20v-6h6v6"/></svg></span><div><strong>Sala</strong><small>Robô de carteira cripto</small></div></div>
+    <button type="button" class="status" id="status" aria-haspopup="dialog"><span class="orb" aria-hidden="true"></span><span class="status-txt" id="statusTxt"></span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button>
+    <div class="top-actions"><span class="mode" id="mode"></span><button type="button" class="ib" id="theme"></button></div>
+  </header>
+  <div class="stage-wrap">
+    <div class="rail"><nav class="dock dock-side glass" id="dockSide" aria-label="Seções da Sala"></nav></div>
+    <main class="stage">
+      <header class="view-head"><div><h1 id="vt"></h1><p id="vd"></p></div><div class="view-actions" id="va"></div></header>
+      <div class="content" id="content"></div>
+    </main>
+    <nav class="dock dock-bottom glass" id="dockBottom" aria-label="Seções da Sala"></nav>
+  </div>
+  <footer class="foot"><span id="upd"></span><span>Preços reais, ordens simuladas. Isto não é recomendação de investimento.</span></footer>
+</div>
+<dialog id="dlg" aria-labelledby="dlgT"><section class="dlg"><header><h2 id="dlgT">Avisos</h2><button type="button" class="ib" id="dlgX" aria-label="Fechar"></button></header><div id="dlgB"></div></section></dialog>
+
+<script>
+/*__DADOS__*/
+const LAB={"rodadas": [{"n": 1, "titulo": "Tendência, calma e previsão", "base": "segurar", "criterio": "Precisava render ao menos metade do que segurar, com queda máxima de no máximo metade, e não sangrar no último ano.", "ideias": [{"id": "A", "nome": "Tendência", "regra": "Fica comprado quando o preço está acima da média dos últimos 200 dias. Senão, fica em caixa.", "estado": "reprovada", "moedas": {"BTC": {"ano": 0.24391345966184375, "base_ano": 0.37898564555613445, "queda": -0.6537114594974562, "base_queda": -0.766292543164593, "ops": 30}, "ETH": {"ano": 0.39413563621903513, "base_ano": 0.4195786525822589, "queda": -0.7214057991851082, "base_queda": -0.7930253453633336, "ops": 23}}, "motivo": "Reprovada: no BTC a queda máxima não ficou nem pela metade da de segurar; no ETH a queda máxima não ficou nem pela metade da de segurar."}, {"id": "B", "nome": "Calma", "regra": "Fica comprado quando a oscilação dos últimos 30 dias está abaixo da mediana do último ano.", "estado": "reprovada", "moedas": {"BTC": {"ano": 0.008649550506761416, "base_ano": 0.37898564555613445, "queda": -0.7724493641510892, "base_queda": -0.766292543164593, "ops": 40}, "ETH": {"ano": 0.3575921135510658, "base_ano": 0.4195786525822589, "queda": -0.6986138056642711, "base_queda": -0.7930253453633336, "ops": 44}}, "motivo": "Reprovada: no BTC rendeu menos da metade do que segurar; no BTC a queda máxima não ficou nem pela metade da de segurar; no BTC perdeu mais de 10% no último ano; no ETH a queda máxima não ficou nem pela metade da de segurar; no ETH perdeu mais de 10% no último ano; no ETH não ganhou de segurar no último ano."}, {"id": "C", "nome": "Tendência e calma juntas", "regra": "Só fica comprado quando as duas condições valem ao mesmo tempo.", "estado": "reprovada", "moedas": {"BTC": {"ano": -0.05396084517990385, "base_ano": 0.37898564555613445, "queda": -0.6186248400496838, "base_queda": -0.766292543164593, "ops": 36}, "ETH": {"ano": 0.46047637486336335, "base_ano": 0.4195786525822589, "queda": -0.4384050341739888, "base_queda": -0.7930253453633336, "ops": 38}}, "motivo": "Reprovada: no BTC rendeu menos da metade do que segurar; no BTC a queda máxima não ficou nem pela metade da de segurar; no ETH a queda máxima não ficou nem pela metade da de segurar; no ETH perdeu mais de 10% no último ano."}, {"id": "M", "nome": "Modelo de previsão", "estado": "reprovada", "regra": "Regressão logística que estima a chance de o preço subir em 7 dias. Compra quando a chance passa de 55% e sai abaixo de 50%.", "moedas": {"BTC": {"ano": 0.004002170628266244, "base_ano": 0.37898564555613445, "queda": -0.8166407295361305, "base_queda": -0.766292543164593, "ops": 65}, "ETH": {"ano": -0.02810916878041736, "base_ano": 0.4195786525822589, "queda": -0.7137148441567385, "base_queda": -0.7930253453633336, "ops": 78}}, "motivo": "Reprovada: a taxa de acerto (AUC) foi 0,47 no BTC e 0,47 no ETH. Cara ou coroa dá 0,50 e o mínimo exigido era 0,55. Não invertemos o sinal nem ajustamos o modelo depois de ver o resultado."}]}, {"n": 2, "titulo": "Comprar na baixa, vender na alta", "base": "segurar", "criterio": "Mesma régua de retorno e queda, com pelo menos 20 operações por moeda.", "ideias": [{"id": "D", "nome": "RSI", "regra": "Compra quando o RSI de 14 dias cai abaixo de 30 (preço esticado para baixo) e vende acima de 70.", "estado": "reprovada", "moedas": {"BTC": {"ano": -0.02786647630800987, "base_ano": 0.37898564555613445, "queda": -0.6881515284527504, "base_queda": -0.766292543164593, "ops": 26}, "ETH": {"ano": -0.06538407765545651, "base_ano": 0.4195786525822589, "queda": -0.7038818736908865, "base_queda": -0.7930253453633336, "ops": 25}}, "motivo": "Reprovada: no BTC rendeu menos da metade do que segurar; no BTC a queda máxima não ficou nem pela metade da de segurar; no ETH rendeu menos da metade do que segurar; no ETH a queda máxima não ficou nem pela metade da de segurar."}, {"id": "E", "nome": "Bollinger", "regra": "Compra quando o preço fecha abaixo da média de 20 dias menos 2 desvios e vende quando volta acima da média.", "estado": "reprovada", "moedas": {"BTC": {"ano": -0.012867504636422167, "base_ano": 0.37898564555613445, "queda": -0.5549530175636703, "base_queda": -0.766292543164593, "ops": 38}, "ETH": {"ano": 0.09190694457130899, "base_ano": 0.4195786525822589, "queda": -0.585866810309025, "base_queda": -0.7930253453633336, "ops": 41}}, "motivo": "Reprovada: no BTC rendeu menos da metade do que segurar; no BTC a queda máxima não ficou nem pela metade da de segurar; no ETH rendeu menos da metade do que segurar; no ETH a queda máxima não ficou nem pela metade da de segurar."}, {"id": "F", "nome": "Queda e alta de 10% em 7 dias", "regra": "Compra depois de uma queda de 10% em 7 dias e vende depois de uma alta de 10% em 7 dias.", "estado": "reprovada", "moedas": {"BTC": {"ano": 0.20091280809678969, "base_ano": 0.37898564555613445, "queda": -0.5427973946561819, "base_queda": -0.766292543164593, "ops": 34}, "ETH": {"ano": -0.09467194146982161, "base_ano": 0.4195786525822589, "queda": -0.7344643666514332, "base_queda": -0.7930253453633336, "ops": 41}}, "motivo": "Reprovada: no BTC a queda máxima não ficou nem pela metade da de segurar; no ETH rendeu menos da metade do que segurar; no ETH a queda máxima não ficou nem pela metade da de segurar."}]}, {"n": 3, "titulo": "Rebalanceamento por faixas", "base": "mistura parada", "criterio": "Aqui a comparação é com a mesma mistura 70/30 parada. Precisava render ao menos o mesmo, cair no máximo o mesmo e fazer 20 ou mais rebalanceamentos por moeda.", "ideias": [{"id": "G", "nome": "Rebalanceamento 70/30", "estado": "simulacao", "regra": "Mantém 70% na moeda e 30% em caixa. Vende o excesso acima de 80% e compra abaixo de 60%.", "moedas": {"BTC": {"ano": 0.3257838485316622, "base_ano": 0.31515558934939736, "queda": -0.6102132456808216, "base_queda": -0.7167670647290629, "ops": 12}, "ETH": {"ano": 0.4013362838731489, "base_ano": 0.3520000583950502, "queda": -0.6520436502642898, "base_queda": -0.7727891139055183, "ops": 21}}, "motivo": "Rendeu mais e caiu menos que a mesma mistura parada nas duas moedas, mas o BTC fez só 12 rebalanceamentos, abaixo do mínimo de 20. Por isso não passou na régua. É a que o robô usa em simulação, para ser testada com dados novos."}]}]};
+const $=id=>document.getElementById(id);
+const nf0=new Intl.NumberFormat('pt-BR',{maximumFractionDigits:0});
+const usd=n=>(n<0?'−':'')+'US$ '+nf0.format(Math.abs(n));
+const usd2=n=>'US$ '+n.toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2});
+const pc=(x,d=0)=>(x*100).toLocaleString('pt-BR',{minimumFractionDigits:d,maximumFractionDigits:d})+'%';
+const sg=(x,d=0)=>(Math.round(x*10**(d+2))===0?'':x>0?'+':'−')+pc(Math.abs(x),d);
+const MES=['jan','fev','mar','abr','mai','jun','jul','ago','set','out','nov','dez'];
+const U=t=>new Date(t);
+const dt=t=>{const d=U(t);return String(d.getUTCDate()).padStart(2,'0')+'/'+String(d.getUTCMonth()+1).padStart(2,'0')+'/'+String(d.getUTCFullYear()).slice(2)};
+const mm=t=>{const d=U(t);return MES[d.getUTCMonth()]+'/'+String(d.getUTCFullYear()).slice(2)};
+const DIA=86400000;
+const C=D.cfg,A=D.analise,E=D.est,V=A.valores,H=E.hist,KS=Object.keys(A.moedas),DEMO=D.rotulo==='demo';
+const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+const P={
+ sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+ wallet:'<path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1"/><path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4"/>',
+ compass:'<circle cx="12" cy="12" r="10"/><path d="m16.2 7.8-2.1 6.3-6.3 2.1 2.1-6.3z"/>',
+ swap:'<path d="m17 3 4 4-4 4"/><path d="M3 7h18"/><path d="m7 21-4-4 4-4"/><path d="M21 17H3"/>',
+ flask:'<path d="M10 2v7.5L4.5 19A2 2 0 0 0 6.3 22h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><path d="M8.5 2h7"/><path d="M7 16h10"/>',
+ moon:'<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>',
+ up:'<path d="M7 17 17 7"/><path d="M8 7h9v9"/>',
+ down:'<path d="M7 7l10 10"/><path d="M17 8v9H8"/>',
+ dl:'<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
+ ok:'<path d="m5 12 5 5L20 7"/>',
+ x:'<path d="M6 6l12 12M18 6 6 18"/>',
+ alert:'<path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>',
+ clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+ cal:'<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+ coin:'<circle cx="12" cy="12" r="9"/><path d="M14.5 9a3 3 0 0 0-5 1.5c0 3 5 1.5 5 4.5a3 3 0 0 1-5 1.5M12 6.5v11"/>',
+ trend:'<path d="m22 17-8.5-8.5-5 5L2 7"/><path d="M16 17h6v-6"/>',
+ info:'<circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>'
+};
+const ico=(n)=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[n]}</svg>`;
+const VIEWS=[
+ {id:'hoje',nome:'Hoje',ic:'sun',desc:'O que o robô vai fazer e como a carteira está.'},
+ {id:'carteira',nome:'Carteira',ic:'wallet',desc:'Evolução, quedas e o que aconteceria num cenário ruim.'},
+ {id:'estudo',nome:'Estudo',ic:'compass',desc:'Como está o mercado e o que o passado diz sobre dias parecidos.'},
+ {id:'operacoes',nome:'Operações',ic:'swap',desc:'Próximo aporte, ordens simuladas e a checagem antes do dinheiro real.'},
+ {id:'testes',nome:'Testes',ic:'flask',desc:'Tudo o que já testamos, inclusive o que não funcionou.'}
+];
+let view=null,period='tudo',opsMoeda='todas',opsTipo='todos',cleanup=[];
+
+/* ---------- avisos e frase do dia ---------- */
+const pend=KS.filter(k=>A.moedas[k].acao!=='manter');
+const hojeUTC=Math.floor(Date.now()/DIA)*DIA;
+const atraso=!DEMO&&E.ultimo_dia?Math.round((hojeUTC-DIA-E.ultimo_dia)/DIA):0;
+const diasSim=E.inicio&&E.ultimo_dia?Math.round((E.ultimo_dia-E.inicio)/DIA)+1:0;
+function avisos(){
+ const a=[];
+ if(DEMO)a.push({tipo:'info',ic:'info',t:'Isto é uma demonstração',x:'Os números vêm de uma reexecução do passado. A simulação ao vivo aparece no painel.html gerado no seu computador.'});
+ if(atraso>=2)a.push({tipo:'alerta',ic:'clock',t:`O robô não roda há ${atraso} dias`,x:'Abra rodar_robo.bat para atualizar. Ele recupera sozinho os dias que faltam.',ir:'hoje'});
+ pend.forEach(k=>{const m=A.moedas[k];a.push({tipo:'acao',ic:m.acao==='compra'?'down':'up',t:`Amanhã na abertura: ${m.acao==='compra'?'comprar':'vender'} ${usd(m.valor_ordem)} de ${k}`,x:`O peso está em ${pc(m.peso)}, fora da faixa de ${pc(C.piso)} a ${pc(C.topo)}.`,ir:'hoje'})});
+ if(E.dd.robo<=-0.2)a.push({tipo:'alerta',ic:'trend',t:`A carteira está ${pc(Math.abs(E.dd.robo))} abaixo do pico`,x:'A regra não muda por causa disso. Confira se o valor investido é um dinheiro que aguenta ver cair assim.',ir:'carteira'});
+ if(C.aporte_mensal>0)a.push({tipo:'info',ic:'cal',t:`Próximo aporte em ${A.aporte.proximo}`,x:`${usd(A.aporte.valor)}, dividido igualmente entre as moedas.`,ir:'operacoes'});
+ if(!DEMO&&diasSim<56)a.push({tipo:'info',ic:'shield',t:`Faltam ${56-diasSim} dias para as 8 semanas mínimas`,x:'Só depois disso faz sentido discutir dinheiro real.',ir:'operacoes'});
+ return a;
+}
+P.shield='<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>';
+const AV=avisos();
+function statusLinha(){
+ const f=AV.find(a=>a.tipo==='alerta')||AV.find(a=>a.tipo==='acao');
+ if(f)return{tipo:f.tipo,t:f.t};
+ return{tipo:'ok',t:`Tudo dentro da faixa. Próximo aporte em ${A.aporte.proximo.slice(0,5)}.`};
+}
+function fraseHoje(){
+ if(!H.length)return{t:'A simulação começou.',x:`A compra inicial foi feita ao preço de abertura de hoje, levando cada moeda a ${pc(C.alvo)} da sua fatia. O primeiro fechamento diário acontece às 21h, e é ali que o robô passa a avaliar as faixas.`};
+ if(!pend.length){
+  const lista=KS.map(k=>`${k} (${pc(A.moedas[k].peso)})`).join(' e ');
+  return{t:'Hoje o robô não faz nada.',x:`${lista} estão dentro da faixa de ${pc(C.piso)} a ${pc(C.topo)}. Ele só age quando um peso sai dela, ou no dia do aporte.`};
+ }
+ const acoes=pend.map(k=>`${A.moedas[k].acao==='compra'?'comprar':'vender'} ${usd(A.moedas[k].valor_ordem)} em ${k}`);
+ return{t:`Amanhã, na abertura, o robô vai ${acoes.join(' e ')}.`,x:pend.map(k=>{const m=A.moedas[k];return `O peso de ${k} está em ${pc(m.peso)}, ${m.acao==='compra'?'abaixo do piso de '+pc(C.piso):'acima do teto de '+pc(C.topo)}. A ordem leva de volta a ${pc(C.alvo)}.`}).join(' ')};
+}
+
+/* ---------- gráfico de linha em pixels reais ---------- */
+function niceTicks(min,max,n=4){const span=(max-min)||1,raw=span/n,mag=10**Math.floor(Math.log10(raw)),f=raw/mag,step=(f<=1?1:f<=2?2:f<=5?5:10)*mag,t=[];for(let v=Math.ceil(min/step)*step;v<=max+step*.001;v+=step)t.push(v);return t}
+function mountLine(host,o){
+ const Hs=o.H;
+ if(Hs.length<2){host.innerHTML=`<p class="empty">${o.vazio||'O gráfico aparece depois do segundo fechamento diário.'}</p>`;return}
+ host.classList.add('chart');
+ let idx=null,W=0;
+ const tip=document.createElement('div');tip.className='tip';tip.hidden=true;
+ const live=document.createElement('div');live.className='sr';live.setAttribute('aria-live','polite');
+ function draw(){
+  W=Math.max(220,Math.floor(host.clientWidth));const Ht=o.height||280,mini=!!o.mini;
+  const L=mini?2:(o.left||56),R=(!mini&&W>=600)?112:(mini?2:12),T=mini?6:12,B=mini?4:26;
+  const all=o.series.flatMap(s=>Hs.map(h=>s.get(h)));
+  const [y0,y1]=o.domain(all);
+  const X=i=>L+(W-L-R)*i/(Hs.length-1),Y=v=>T+(Ht-T-B)*(1-(v-y0)/((y1-y0)||1));
+  let g='';
+  if(!mini){niceTicks(y0,y1).forEach(v=>{g+=`<line class="gl" x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}"/><text x="${L-8}" y="${Y(v)+4}" text-anchor="end">${o.fmtY(v)}</text>`});
+   for(let i=0;i<5;i++){const j=Math.round((Hs.length-1)*i/4);g+=`<text x="${X(j)}" y="${Ht-6}" text-anchor="${i==0?'start':i==4?'end':'middle'}">${mm(Hs[j].t)}</text>`}}
+  const path=s=>Hs.map((h,i)=>(i?'L':'M')+X(i).toFixed(1)+' '+Y(s.get(h)).toFixed(1)).join('');
+  if(o.area){const s=o.series.find(q=>q.key===o.area);g+=`<path class="area" d="${path(s)} L${X(Hs.length-1)} ${Y(y1<=0?0:y0)} L${X(0)} ${Y(y1<=0?0:y0)}Z"/>`}
+  o.series.forEach(s=>{g+=`<path class="s ${s.cls}" d="${path(s)}" stroke-width="${s.w}" ${s.dash?`stroke-dasharray="${s.dash}"`:''}/>`});
+  if(!mini&&R>20){const ys=o.series.filter(s=>s.label).map(s=>({s,y:Y(s.get(Hs[Hs.length-1]))})).sort((a,b)=>a.y-b.y);
+   for(let i=1;i<ys.length;i++)if(ys[i].y-ys[i-1].y<14)ys[i].y=ys[i-1].y+14;
+   ys.forEach(({s,y})=>{g+=`<text class="${s.lc}" x="${W-R+8}" y="${y+4}">${s.label}</text>`})}
+  g+=`<line class="cur" y1="${T}" y2="${Ht-B}"/>`;
+  o.series.filter(s=>!s.nodot).forEach(s=>{g+=`<circle class="dot-${s.key}" r="4.5" cx="-10" cy="-10" fill="${s.dotc}" stroke="var(--surface)" stroke-width="2" style="display:none"/>`});
+  host.innerHTML=`<svg width="${W}" height="${Ht}" viewBox="0 0 ${W} ${Ht}" role="img" aria-label="${o.label}" tabindex="0">${g}</svg>`;
+  host.appendChild(tip);host.appendChild(live);
+  const svg=host.querySelector('svg');
+  const show=i=>{idx=i;const h=Hs[i],x=X(i);
+   svg.querySelector('.cur').setAttribute('x1',x);svg.querySelector('.cur').setAttribute('x2',x);svg.querySelector('.cur').style.opacity=.7;
+   o.series.filter(s=>!s.nodot).forEach(s=>{const c=svg.querySelector('.dot-'+s.key);c.style.display='';c.setAttribute('cx',x);c.setAttribute('cy',Y(s.get(h)))});
+   tip.innerHTML=o.tip(h);tip.hidden=false;live.textContent=tip.textContent;
+   const w=tip.offsetWidth;let lx=x+14;if(lx+w>W)lx=x-w-14;tip.style.left=Math.max(0,lx)+'px'};
+  const hide=()=>{idx=null;tip.hidden=true;svg.querySelector('.cur').style.opacity=0;svg.querySelectorAll('circle').forEach(c=>{c.style.display='none'})};
+  svg.addEventListener('pointermove',e=>{const r=svg.getBoundingClientRect();let i=Math.round((e.clientX-r.left-L)/(W-L-R)*(Hs.length-1));show(Math.max(0,Math.min(Hs.length-1,i)))});
+  svg.addEventListener('pointerleave',hide);svg.addEventListener('blur',hide);
+  svg.addEventListener('keydown',e=>{const n=Hs.length-1;let i=idx===null?n:idx;
+   if(e.key==='ArrowLeft')i=Math.max(0,i-(e.shiftKey?20:1));else if(e.key==='ArrowRight')i=Math.min(n,i+(e.shiftKey?20:1));else if(e.key==='Home')i=0;else if(e.key==='End')i=n;else return;
+   e.preventDefault();show(i)});
+ }
+ draw();
+ let last=host.clientWidth;const ro=new ResizeObserver(()=>{if(Math.abs(host.clientWidth-last)>2){last=host.clientWidth;draw()}});ro.observe(host);
+ const d=()=>ro.disconnect();cleanup.push(d);return d;
+}
+const SER={
+ robo:{key:'robo',cls:'s-robo',lc:'lab-robo',w:3,label:'Robô',dotc:'var(--teal)',get:h=>h.eq.robo},
+ par:{key:'par70',cls:'s-par',lc:'lab-par',w:2,label:'Parada 70/30',dotc:'var(--ink)',get:h=>h.eq.par70},
+ cheio:{key:'cheio',cls:'s-cheio',lc:'lab-cheio',w:1.8,dash:'7 5',label:'100% parado',dotc:'var(--mut)',get:h=>h.eq.cheio},
+ ap:{key:'contrib',cls:'s-ap',lc:'',w:1.4,dash:'2 4',nodot:true,get:h=>h.contrib}
+};
+const filtrar=(p)=>{if(p==='tudo'||!H.length)return H;const n={'30':30,'90':90,'365':365}[p],lim=H[H.length-1].t-n*DIA;const r=H.filter(h=>h.t>=lim);return r.length>1?r:H.slice(-2)};
+const tipEq=h=>`<b>${dt(h.t)}</b><span>Robô <b>${usd(h.eq.robo)}</b></span><span>Parada 70/30 <b>${usd(h.eq.par70)}</b></span><span>100% parado <b>${usd(h.eq.cheio)}</b></span><span>Aportado <b>${usd(h.contrib)}</b></span>`;
+const domEq=all=>[0,Math.max(...all)*1.06];
+const legendEq=`<div class="legend"><span style="--lc:var(--teal)"><i></i>Robô</span><span style="--lc:var(--ink)"><i></i>Mesma mistura 70/30 parada</span><span style="--lc:var(--mut);--ls:dashed"><i></i>100% na moeda, parado</span><span style="--lc:var(--mut);--ls:dotted"><i></i>Total aportado</span></div>`;
+
+/* ---------- peças ---------- */
+function gauge(k,m){
+ const lb=(v,t)=>`<span class="lb" style="left:${v*100}%">${t}</span>`;
+ const txt=m.acao==='manter'?(m.preco_venda?`Vende acima de <b>${usd(m.preco_venda)}</b> (${sg(m.sobe_ate_vender)}). Compra abaixo de <b>${usd(m.preco_compra)}</b> (${sg(m.cai_ate_comprar)}).`:'Sem posição na moeda.'):`Fora da faixa: <b>${m.acao==='compra'?'compra':'venda'} de ${usd(m.valor_ordem)}</b> na abertura de amanhã.`;
+ return `<div class="coin" data-coin="${k}"><div class="coin-top"><span class="coin-name"><i></i>${k}</span><strong class="coin-peso">${pc(m.peso)}</strong></div>
+ <div class="gauge" role="img" aria-label="${k}: ${pc(m.peso)} da fatia em moeda, faixa de ${pc(C.piso)} a ${pc(C.topo)}"><span class="band" style="left:${C.piso*100}%;width:${(C.topo-C.piso)*100}%"></span><span class="pin" style="left:${Math.max(2,Math.min(98,m.peso*100))}%"></span>${lb(C.piso,pc(C.piso))}${lb(C.alvo,pc(C.alvo))}${lb(C.topo,pc(C.topo))}</div>
+ <p class="small">${txt}</p></div>`;
+}
+const cnt=(v,f)=>`<span data-count="${v}" data-f="${f}">${f==='usd'?usd(v):f==='pct1'?pc(v,1):v}</span>`;
+function kpi(t,ic,body,cap,dest){return `<article class="card kpi${dest?' dest':''}"><div class="kpi-h"><span>${t}</span><span class="kpi-i">${ico(ic)}</span></div><b>${body}</b><small>${cap}</small></article>`}
+function ring(){
+ const parts=KS.map(k=>({k,n:k,v:A.moedas[k].valor_moeda})).concat([{k:'CAIXA',n:'Caixa (USDT)',v:KS.reduce((s,k)=>s+A.moedas[k].caixa,0)}]);
+ const tot=parts.reduce((s,p)=>s+p.v,0)||1;let off=0;
+ const seg=parts.map((p,i)=>{const r=p.v/tot*100,o=off;off+=r;return `<circle class="sg" data-i="${i}" cx="62" cy="62" r="47" pathLength="100" style="--c:var(--${p.k==='BTC'?'ochre':p.k==='ETH'?'blue':'cash'})" stroke-dasharray="${Math.max(0,r-1)} 100" stroke-dashoffset="${-o}"/>`}).join('');
+ return `<div class="ringbox"><div class="ring"><svg viewBox="0 0 124 124" aria-hidden="true"><circle cx="62" cy="62" r="47" fill="none" stroke="var(--track)" stroke-width="14"/><g transform="rotate(-90 62 62)">${seg}</g></svg><div class="ring-c"><b id="rg-v">${usd(tot)}</b><span id="rg-l">na carteira</span></div></div>
+ <div class="lg-list">${parts.map((p,i)=>`<button type="button" data-i="${i}" data-coin="${p.k}" aria-pressed="false" data-v="${usd(p.v)}" data-n="${p.n}"><span class="nm"><i class="dot-k" style="background:var(--c)"></i>${p.n}</span><b>${pc(p.v/tot)} <span class="mut">${usd(p.v)}</span></b></button>`).join('')}</div></div>`;
+}
+function bindRing(root){
+ const bs=root.querySelectorAll('.lg-list button'),sg_=root.querySelectorAll('circle.sg'),rv=root.querySelector('#rg-v'),rl=root.querySelector('#rg-l');if(!rv)return;
+ const tv=rv.textContent;
+ bs.forEach(b=>b.addEventListener('click',()=>{const on=b.getAttribute('aria-pressed')==='true';bs.forEach(x=>x.setAttribute('aria-pressed','false'));
+  sg_.forEach(s=>s.dataset.m='false');
+  if(on){rv.textContent=tv;rl.textContent='na carteira';return}
+  b.setAttribute('aria-pressed','true');sg_.forEach(s=>s.dataset.m=String(s.dataset.i!==b.dataset.i));rv.textContent=b.dataset.v;rl.textContent=b.dataset.n}));
+}
+
+/* ---------- visões ---------- */
+function vHoje(){
+ const f=fraseHoje(),res=V.robo-E.contrib,dif=V.robo-V.par70,h90=filtrar('90');
+ return `<section class="hero"><h2 class="hero-title">${f.t}</h2><p class="hero-text">${f.x}</p>
+ <div class="coins">${KS.map(k=>gauge(k,A.moedas[k])).join('')}</div>
+ <p class="small mut" style="margin-top:10px">O peso mostra quanto da fatia de cada moeda está na própria moeda. O resto fica em caixa, em dólar digital. A faixa verde é onde o robô não mexe.</p></section>
+ <div class="grid g-hoje">
+  <article class="card"><div class="card-head"><div><h2>Valor da carteira</h2>${D.brl?`<p class="sub">cerca de R$ ${nf0.format(V.robo*D.brl)}</p>`:''}</div></div>
+   <span class="big">${cnt(V.robo,'usd')}</span>
+   <div class="row"><span>Total aportado</span><span>${usd(E.contrib)}</span></div>
+   <div class="row"><span>Resultado</span><span class="delta ${res<0?'neg':''}">${res<0?'−':'+'}${usd(Math.abs(res)).replace('US$ ','US$ ')} (${sg(E.contrib?res/E.contrib:0,1)})</span></div>
+   <div class="row"><span>Contra a mesma mistura parada</span><span class="delta ${dif<0?'neg':''}">${dif<0?'−':'+'}${usd(Math.abs(dif))}</span></div></article>
+  <article class="card mid"><div class="card-head"><div><h2>Últimos 90 dias</h2><p class="sub">Robô contra a mesma mistura parada</p></div><a class="btn" href="#carteira">Ver carteira ${ico('up')}</a></div><div id="mini"></div></article>
+  <article class="card"><div class="card-head"><div><h2>Próximos passos</h2></div></div>
+   <div class="row"><span>Próximo aporte</span><span><b>${A.aporte.proximo}</b><br><span class="mut">${usd(A.aporte.valor)}</span></span></div>
+   <div style="padding-top:10px;border-top:1px solid var(--line)"><div class="row" style="border:0;padding:0 0 2px"><span>Simulação antes do dinheiro real</span><span style="white-space:nowrap">${Math.min(diasSim,56)} de 56 dias</span></div>
+   <div class="meter" role="meter" aria-label="Dias de simulação" aria-valuemin="0" aria-valuemax="56" aria-valuenow="${Math.min(diasSim,56)}"><i style="width:${Math.min(1,diasSim/56)*100}%"></i></div>
+   <a class="btn" href="#operacoes">Ver operações ${ico('up')}</a></div></article>
+ </div>${DEMO?`<p class="note" style="margin-top:14px"><strong>Demonstração.</strong> Os números vêm de uma reexecução do passado até ${dt(E.ultimo_dia)}. Nada aqui é ao vivo.</p>`:''}`;
+}
+function vCarteira(){
+ const res=V.robo-E.contrib,dif=V.robo-V.par70,r=A.risco,rt=A.risco_total;
+ return `<div class="grid g-4" style="margin-bottom:14px">
+  ${kpi('Valor da carteira','wallet',cnt(V.robo,'usd'),D.brl?`cerca de R$ ${nf0.format(V.robo*D.brl)}`:'em dólar digital',true)}
+  ${kpi('Resultado','coin',`<span class="delta ${res<0?'neg':''}">${res<0?'−':'+'}${usd(Math.abs(res))}</span>`,`${sg(E.contrib?res/E.contrib:0,1)} sobre ${usd(E.contrib)} aportados`)}
+  ${kpi('Contra a mesma mistura parada','swap',`<span class="delta ${dif<0?'neg':''}">${dif<0?'−':'+'}${usd(Math.abs(dif))}</span>`,'positivo = rebalancear ajudou')}
+  ${kpi('Queda atual do pico','trend',pc(E.dd.robo,1).replace('-','−'),`pior até agora: ${pc(E.ddmax.robo,1).replace('-','−')}`)}
+ </div>
+ <article class="card" style="margin-bottom:14px"><div class="card-head"><div><h2>Valor da carteira ao longo do tempo</h2><p class="sub">Passe o dedo ou o mouse no gráfico. Com o teclado, use as setas.</p></div></div>${legendEq}<div id="big"></div>
+  <details style="margin-top:10px"><summary class="small mut" style="cursor:pointer;min-height:32px">Ver como tabela</summary><div id="tab" style="max-height:300px;overflow:auto;margin-top:6px"></div></details></article>
+ <div class="grid g-2" style="margin-bottom:14px">
+  <article class="card" style="display:flex;flex-direction:column"><div class="card-head"><div><h2>Composição agora</h2><p class="sub">Toque numa linha para destacar</p></div></div>${ring()}</article>
+  <article class="card"><div class="card-head"><div><h2>Quedas desde o último pico</h2><p class="sub">Quanto a carteira estava abaixo do melhor momento dela</p></div></div>
+   <div class="legend"><span style="--lc:var(--teal)"><i></i>Robô</span><span style="--lc:var(--mut);--ls:dashed"><i></i>100% parado</span></div><div id="ddc"></div></article>
+ </div>
+ <article class="card"><div class="card-head"><div><h2>E se repetir o pior?</h2><p class="sub">Aplica à carteira de hoje as piores janelas de 30 dias que cada moeda já teve</p></div></div>
+  ${Object.keys(r).map(k=>`<div class="row"><span>${k}: pior janela de 30 dias da história (${sg(r[k].pior30)})</span><span style="white-space:nowrap">${usd(r[k].perda_pior30)}</span></div>`).join('')}
+  <div class="row"><span><b>Carteira toda</b>, se as duas repetirem o pior ao mesmo tempo</span><span style="white-space:nowrap"><b>${usd(rt.pior30)}</b> (${sg(rt.total?rt.pior30/rt.total:0)})</span></div>
+  <div class="row"><span>Uma em cada 20 janelas de 30 dias foi pior que</span><span style="white-space:nowrap">${usd(rt.p5_30)} (${sg(rt.total?rt.p5_30/rt.total:0)})</span></div>
+  <p class="note" style="margin-top:12px">Com ${pc(C.alvo)} em moeda, quedas de 60% ou mais na carteira já aconteceram nos testes. Só use dinheiro que aguenta ver cair assim.</p></article>`;
+}
+function vEstudo(){
+ const bloco=(k,e)=>{
+  if(!e)return `<article class="card"><h2>${k}</h2><p class="empty" style="margin-top:10px">Histórico insuficiente para estudar esta moeda.</p></article>`;
+  const pr=(h)=>{const p=e.prob[String(h)];if(!p)return '';
+   return `<div class="prob"><p class="small"><b>Daqui a ${h} dias</b>, em ${p.n} dias parecidos no passado${p.n<60?' (amostra pequena)':''}</p>
+   <div class="bars" style="margin-top:8px"><div class="bar-r"><span>Situação parecida</span><div class="bar-t" style="--c:var(--${k==='BTC'?'ochre':'blue'})"><i style="width:${p.p_alta*100}%"></i></div><b>${pc(p.p_alta)}</b></div>
+   <div class="bar-r"><span>No geral</span><div class="bar-t" style="--c:var(--cash)"><i style="width:${p.base*100}%"></i></div><b>${pc(p.base)}</b></div></div>
+   <p class="small mut" style="margin-top:6px">Chance de subir. Retorno típico ${sg(p.mediana,1)}; em 9 de cada 10 casos ficou entre ${sg(p.p5)} e ${sg(p.p95)}.</p></div>`};
+  return `<article class="card" data-coin="${k}"><div class="card-head"><div><h2 style="display:flex;align-items:center;gap:8px"><i class="dot-k" style="background:var(--c)"></i>${k}</h2><p class="sub">${usd(e.preco)}</p></div><span class="chip">${e.tendencia_alta?'Tendência de alta':'Tendência de baixa'}</span></div>
+  <p class="small" style="margin-bottom:10px">${D.textos[k]}</p>
+  <div class="row"><span>Distância da média de 200 dias</span><span>${sg(e.dist_sma200)}</span></div>
+  <div class="row"><span>Últimos 7 e 30 dias</span><span>${sg(e.ret7,1)} e ${sg(e.ret30,1)}</span></div>
+  <div class="row"><span>Oscilação anualizada</span><span>${pc(e.vol)} (mais agitado que ${pc(e.vol_pctil)} dos dias)</span></div>
+  <div class="row"><span>RSI de 14 dias</span><span>${e.rsi.toFixed(0)}</span></div>${pr(7)}${pr(30)}</article>`};
+ return `<p class="note" style="margin-bottom:14px"><strong>Isto informa, mas não manda no robô.</strong> A probabilidade é a frequência histórica em situações parecidas, e dias vizinhos se repetem, então a confiança real é menor do que o número sugere. Nos testes, modelos de previsão não acertaram mais que o acaso. Quem decide é a regra de faixas.</p>
+ <div class="grid g-2">${KS.map(k=>bloco(k,D.estudos[k])).join('')}</div>`;
+}
+function vOperacoes(){
+ const ap=A.aporte;
+ return `<div class="grid g-2" style="margin-bottom:14px">
+ <article class="card"><div class="card-head"><div><h2>Antes do próximo aporte</h2><p class="sub">${C.aporte_mensal>0?`Em ${ap.proximo}, ${usd(ap.valor)} divididos entre as moedas. Conta feita com os preços de agora.`:'O aporte mensal está desligado em config.json.'}</p></div></div>
+  ${C.aporte_mensal>0?ap.itens.map(i=>`<div class="row"><span>${i.moeda}: entram ${usd2(i.entra)}</span><span>${i.compra?`compra ${usd2(i.compra)}, custo ${usd2(i.custo)}`:'fica em caixa, já está no alvo ou acima'}</span></div><div class="row"><span>Peso da moeda</span><span>${pc(i.peso_antes)} → ${pc(i.peso_depois)}</span></div>`).join('')+`<p class="small mut" style="margin-top:8px">No aporte, o robô leva a moeda de volta ao alvo se ela estiver abaixo. Nunca vende no dia do aporte.</p>`:''}</article>
+ <article class="card"><div class="card-head"><div><h2>Antes do dinheiro real</h2><p class="sub">O mínimo que precisa estar marcado</p></div></div>
+  ${A.portao.map(p=>`<div class="ck ${p.ok?'ok':''}"><span class="ck-i">${p.ok?ico('ok'):''}</span><div><b>${p.item}</b><p>${p.ok?'Cumprido':'Falta'}. ${p.detalhe}</p></div></div>`).join('')}
+  <p class="small mut" style="margin-top:10px">Mesmo com tudo marcado, confirme a situação da Binance no Brasil e use uma chave só com permissão de operar, sem saque, presa ao seu IP.</p></article></div>
+ <article class="card"><div class="card-head"><div><h2>Ordens simuladas</h2><p class="sub" id="opsN"></p></div>
+  <div class="view-actions"><label class="sel"><span class="sr">Moeda</span><select id="fM"><option value="todas">Todas as moedas</option>${KS.map(k=>`<option>${k}</option>`).join('')}</select></label>
+  <label class="sel"><span class="sr">Tipo</span><select id="fT"><option value="todos">Todos os tipos</option><option value="inicial">Compra inicial</option><option value="aporte">Aporte</option><option value="rebalanceamento">Rebalanceamento</option></select></label></div></div><div class="ops" id="opsL"></div></article>`;
+}
+function opsLista(){
+ const L=E.ops.slice().reverse().filter(o=>(opsMoeda==='todas'||o.moeda===opsMoeda)&&(opsTipo==='todos'||o.tipo===opsTipo));
+ const tn={inicial:'Compra inicial',aporte:'Aporte',rebalanceamento:'Rebalanceamento'};
+ $('opsN').textContent=E.ops.length?`${L.length} de ${E.ops.length} ordens`:'Ainda sem ordens';
+ $('opsL').innerHTML=L.length?L.slice(0,60).map(o=>`<div class="op"><div class="op-d"><b>${dt(o.t)}</b>${tn[o.tipo]||o.tipo}</div><div class="op-m"><b>${o.lado==='compra'?'Compra':'Venda'} de ${o.moeda}</b><p>${o.motivo}</p></div><div class="op-v"><b>${usd(o.valor)}</b><span>a ${usd(o.preco)}</span></div></div>`).join('')+(L.length>60?`<p class="small mut" style="padding-top:10px">Mostrando as 60 mais recentes. O CSV leva todas.</p>`:''):`<p class="empty">${E.ops.length?'Nenhuma ordem com esse filtro.':`Nenhuma ordem ainda. O robô age quando o peso de uma moeda sai da faixa de ${pc(C.piso)} a ${pc(C.topo)}, ou no dia do aporte.`}</p>`;
+}
+function csv(){
+ const rows=[['Data','Moeda','Lado','Valor (USD)','Preço','Tipo','Motivo']].concat(E.ops.map(o=>[new Date(o.t).toISOString().slice(0,10),o.moeda,o.lado,o.valor,o.preco,o.tipo,o.motivo]));
+ const txt=rows.map(r=>r.map(c=>'"'+String(c).replaceAll('"','""')+'"').join(',')).join('\r\n');
+ const url=URL.createObjectURL(new Blob(['﻿'+txt],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='ordens-simuladas.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),0);
+}
+function vTestes(){
+ const n=LAB.rodadas.reduce((s,r)=>s+r.ideias.filter(i=>i.id!=='M').length,0);
+ return `<p class="note" style="margin-bottom:14px"><strong>${n} regras testadas em BTC e ETH, com a régua escrita antes de rodar.</strong> Nenhuma passou. A que chegou mais perto, o rebalanceamento por faixas, é a que o robô usa hoje, em simulação, justamente para ser testada com dados novos.</p>`+
+ LAB.rodadas.map(r=>`<article class="card lab-r"><div class="card-head"><div><h2>${r.titulo}</h2><p class="sub">${r.criterio}</p></div></div>${r.ideias.map(i=>`<div class="idea"><div class="idea-h"><h3>${i.nome}</h3><span class="chip ${i.estado==='simulacao'?'on':'no'}">${i.estado==='simulacao'?'Em simulação ao vivo':'Reprovada'}</span></div><p class="rule">${i.regra}</p>
+  <div class="nums">${['BTC','ETH'].map(k=>{const m=i.moedas[k];return m?`<div class="num"><b>${k}</b><div><span>Retorno ao ano</span><span>${sg(m.ano)} (${r.base}: ${sg(m.base_ano)})</span></div><div><span>Pior queda</span><span>${sg(m.queda)} (${sg(m.base_queda)})</span></div><div><span>Operações</span><span>${m.ops}</span></div></div>`:''}).join('')}</div>
+  <p class="why">${i.motivo}</p></div>`).join('')}</article>`).join('')+
+ `<p class="small mut">Valores de 2019 a 2025, com custos dobrados. O último ano (nov/2025 a nov/2026) já foi visto, então só serve de informação. As variações do rebalanceamento não foram ajustadas depois do resultado.</p>`;
+}
+const RENDER={hoje:vHoje,carteira:vCarteira,estudo:vEstudo,operacoes:vOperacoes,testes:vTestes};
+
+/* ---------- pós-render ---------- */
+function after(root){
+ const mini=root.querySelector('#mini');
+ if(mini)mountLine(mini,{H:filtrar('90'),height:150,mini:true,label:'Valor da carteira nos últimos 90 dias',series:[SER.par,SER.robo],domain:a=>{const lo=Math.min(...a),hi=Math.max(...a),p=(hi-lo)*.1||1;return[lo-p,hi+p]},tip:tipEq,fmtY:usd,vazio:'O gráfico aparece depois do segundo fechamento diário.'});
+ const big=root.querySelector('#big');
+ if(big){const draw=()=>{const Hf=filtrar(period);if(big._d)big._d();big.innerHTML='';big._d=mountLine(big,{H:Hf,height:window.innerWidth<760?250:320,label:'Valor da carteira ao longo do tempo',series:[SER.ap,SER.cheio,SER.par,SER.robo],domain:domEq,fmtY:v=>v>=1000?nf0.format(v/1000)+' mil':nf0.format(v),tip:tipEq});
+   const step=Math.max(1,Math.floor(Hf.length/30));root.querySelector('#tab').innerHTML=Hf.length?'<table style="width:100%;border-collapse:collapse;font-size:12.5px"><tr style="text-align:left;color:var(--mut)"><th>Data</th><th>Robô</th><th>Parada</th><th>100%</th><th>Aportado</th></tr>'+Hf.filter((h,i)=>i%step===0||i===Hf.length-1).map(h=>`<tr><td>${dt(h.t)}</td><td>${usd(h.eq.robo)}</td><td>${usd(h.eq.par70)}</td><td>${usd(h.eq.cheio)}</td><td>${usd(h.contrib)}</td></tr>`).join('')+'</table>':''};
+  draw();window._redrawBig=draw}
+ const dd=root.querySelector('#ddc');
+ if(dd)mountLine(dd,{H:H,height:230,label:'Queda da carteira desde o último pico',series:[{...SER.cheio,get:h=>h.dd.cheio},{...SER.robo,get:h=>h.dd.robo}],area:'robo',domain:a=>[Math.min(...a,-.05)*1.08,0],fmtY:v=>Math.abs(v)<1e-9?'0%':pc(v).replace('-','−'),left:48,tip:h=>`<b>${dt(h.t)}</b><span>Robô <b>${pc(h.dd.robo,1).replace('-','−')}</b></span><span>100% parado <b>${pc(h.dd.cheio,1).replace('-','−')}</b></span>`});
+ bindRing(root);
+ root.querySelectorAll('[data-count]').forEach(el=>{const v=+el.dataset.count,f=el.dataset.f,fmt=x=>f==='usd'?usd(x):pc(x,1);if(reduce)return;const t0=performance.now();const tick=n=>{const k=Math.min(1,(n-t0)/700),e=1-Math.pow(1-k,3);el.textContent=fmt(v*e);if(k<1)requestAnimationFrame(tick)};requestAnimationFrame(tick)});
+ const fm=root.querySelector('#fM'),ft=root.querySelector('#fT');
+ if(fm){fm.value=opsMoeda;ft.value=opsTipo;fm.onchange=()=>{opsMoeda=fm.value;opsLista()};ft.onchange=()=>{opsTipo=ft.value;opsLista()};opsLista()}
+}
+function actions(v){
+ const a=$('va');a.innerHTML='';
+ if(v==='carteira'){a.innerHTML=`<div class="pills" role="group" aria-label="Período do gráfico">${[['30','30 dias'],['90','90 dias'],['365','1 ano'],['tudo','Tudo']].map(([k,t])=>`<button type="button" data-p="${k}" aria-pressed="${k===period}">${t}</button>`).join('')}</div>`;
+  a.querySelectorAll('button').forEach(b=>b.onclick=()=>{period=b.dataset.p;a.querySelectorAll('button').forEach(x=>x.setAttribute('aria-pressed',String(x===b)));if(window._redrawBig)window._redrawBig()})}
+ if(v==='operacoes'){a.innerHTML=`<button type="button" class="btn prim">${ico('dl')}Baixar CSV</button>`;a.firstChild.onclick=csv}
+}
+function go(next,first){
+ const def=VIEWS.find(x=>x.id===next)||VIEWS[0];
+ if(view===def.id)return;
+ const c=$('content');
+ const paint=()=>{cleanup.forEach(f=>f());cleanup=[];view=def.id;
+  const hh=new Date().getHours();$('vt').textContent=def.id==='hoje'?(DEMO?'Hoje, em demonstração':hh<12?'Bom dia':hh<18?'Boa tarde':'Boa noite'):def.nome;$('vd').textContent=def.desc;document.title=def.nome+' · Sala';
+  actions(def.id);c.innerHTML=RENDER[def.id]();after(c);
+  document.querySelectorAll('.dock a').forEach(a=>a.setAttribute('aria-current',a.dataset.id===def.id?'page':'false'));
+  document.querySelectorAll('.dock a[aria-current=false]').forEach(a=>a.removeAttribute('aria-current'));
+  place();window.scrollTo({top:0});c.classList.remove('out')};
+ if(first||reduce){paint();return}
+ c.classList.add('out');setTimeout(paint,140);
+}
+const route=()=>VIEWS.find(v=>'#'+v.id===location.hash)?.id||'hoje';
+function place(){document.querySelectorAll('.dock').forEach(n=>{const cur=n.querySelector('[aria-current=page]'),ind=n.querySelector('.ind');if(!cur||!ind||!cur.offsetWidth)return;ind.style.width=cur.offsetWidth+'px';ind.style.height=cur.offsetHeight+'px';ind.style.transform=`translate(${cur.offsetLeft}px,${cur.offsetTop}px)`;ind.dataset.ready='true'})}
+
+/* ---------- montagem ---------- */
+function dockHtml(side){return '<span class="ind" aria-hidden="true"></span>'+VIEWS.map(v=>`<a href="#${v.id}" data-id="${v.id}" aria-label="${v.nome}">${ico(v.ic)}<span class="t">${v.nome}</span>${side?`<span class="tipnav" aria-hidden="true">${v.nome}</span>`:''}</a>`).join('')}
+$('dockSide').innerHTML=dockHtml(true);$('dockBottom').innerHTML=dockHtml(false);
+const sl=statusLinha();$('status').dataset.tipo=sl.tipo;$('statusTxt').textContent=sl.t;
+$('mode').dataset.demo=String(DEMO);$('mode').innerHTML='<i></i>'+(DEMO?'Demonstração do passado':'Simulação, sem dinheiro real');
+$('upd').textContent='Atualizado em '+D.atualizado+(D.brl?`, US$ 1 ≈ R$ ${D.brl.toFixed(2).replace('.',',')}`:'');
+const root=document.documentElement;
+let tema=root.dataset.theme||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
+try{tema=localStorage.getItem('sala-tema')||tema}catch(e){}
+function setTema(t){tema=t;root.dataset.theme=t;$('theme').innerHTML=ico(t==='light'?'moon':'sun');$('theme').setAttribute('aria-label',t==='light'?'Usar tema escuro':'Usar tema claro');try{localStorage.setItem('sala-tema',t)}catch(e){}}
+$('theme').onclick=()=>setTema(tema==='light'?'dark':'light');setTema(tema);
+$('dlgX').innerHTML=ico('x');
+const dlg=$('dlg');
+$('status').onclick=()=>{$('dlgB').innerHTML=AV.map(a=>{const inner=`<span class="av-i">${ico(a.ic)}</span><div><strong>${a.t}</strong><p>${a.x}</p></div>`;return a.ir?`<a class="av" data-tipo="${a.tipo}" href="#${a.ir}">${inner}</a>`:`<div class="av" data-tipo="${a.tipo}">${inner}</div>`}).join('')||'<p class="empty">Nenhum aviso.</p>';
+ dlg.showModal();dlg.querySelectorAll('a.av').forEach(a=>a.addEventListener('click',()=>dlg.close()))};
+$('dlgX').onclick=()=>dlg.close();dlg.addEventListener('click',e=>{if(e.target===dlg)dlg.close()});
+addEventListener('hashchange',()=>go(route()));
+addEventListener('resize',place);
+new ResizeObserver(place).observe(document.body);
+go(route(),true);
+</script>
+</body>
+</html>
+'''
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "replay":
+        ms = lambda s: int(datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+        cfg = carregar_cfg()
+        if len(sys.argv) > 4: cfg["aporte_mensal"] = float(sys.argv[4])
+        if len(sys.argv) > 5 and sys.argv[5] == "x2": cfg["taxa_pct"] *= 2; cfg["deslize_pct"] *= 2
+        est, an = replay(ms(sys.argv[2]), ms(sys.argv[3]), cfg)
+        for s in MOEDAS:
+            h = [x["rb"][s] for x in est["hist"]]; print(s, "fatia final", round(h[-1], 2))
+        print("robô", est["hist"][-1]["eq"], "| ops", len([o for o in est["ops"] if o["tipo"] == "rebalanceamento"]), "| ddmax", est["ddmax"])
+    else:
+        try:
+            rodada()
+        except Exception as e:
+            print("Não consegui atualizar agora (internet fora ou Binance indisponível). Nada foi alterado."); print("Detalhe:", e)
+            sys.exit(1)
