@@ -1,0 +1,1 @@
+{"capital_inicial": 1000.0, "aporte_mensal": 100.0, "dia_aporte": 5, "alvo": 0.7, "topo": 0.8, "piso": 0.6, "taxa_pct": 0.1, "deslize_pct": 0.05, "ordem_minima": 10.0}
